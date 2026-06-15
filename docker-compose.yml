@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  cli:
+    build: .
+    image: smart_money:latest
+    container_name: smart_money_cli
+    env_file:
+      - .env
+    volumes:
+      # 코드 변경 시 컨테이너 안에서 즉시 반영 (rebuild 없이)
+      - ./:/app
+      # 캐시는 호스트에 영구 보존
+      - ./cache:/app/cache
+      - ./results:/app/results
+      - ./logs:/app/logs
+    working_dir: /app
+    # interactive 사용: docker-compose run cli python3 ...
+    stdin_open: true
+    tty: true
+
+  jupyter:
+    build: .
+    image: smart_money:latest
+    container_name: smart_money_jupyter
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+      - ./cache:/app/cache
+      - ./results:/app/results
+    ports:
+      - "8888:8888"
+    command: >
+      bash -c "pip install jupyterlab &&
+               jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token=''"

@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+cache/
+results/
+logs/
+.ipynb_checkpoints/
+.DS_Store
+
+data/raw/          ← 수GB, 절대 올리면 안 됨
+models/saved/      ← pkl 파일
+*.pkl
+data/cache/
