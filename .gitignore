@@ -11,3 +11,14 @@ data/raw/          ← 수GB, 절대 올리면 안 됨
 models/saved/      ← pkl 파일
 *.pkl
 data/cache/
+# Large data files
+data/raw/
+data/cache/
+cache/
+models/saved/
+*.pkl
+*.parquet
+!data/macro/*.parquet
+data/short/
+data/earnings/
+patch_*.py

@@ -50,6 +50,37 @@ def job_update():
     log.info("  데이터 업데이트 시작")
     run("10_update_data.py", ["--market", "KOSPI"])
 
+def job_earnings_update():
+    """어닝 데이터 분기별 업데이트 (실적 발표 후)."""
+    log.info("="*50)
+    log.info("  어닝 데이터 업데이트 (DART API)")
+    run("fetch_earnings.py")
+
+
+def job_macro_update():
+    """매크로 데이터 (금리 ETF) 주간 업데이트."""
+    log.info("="*50)
+    log.info("  매크로 데이터 업데이트")
+    import sys
+    sys.path.insert(0, str(ROOT))
+    try:
+        from data.env_loader import load_env; load_env(override=True)
+        from pykrx import stock
+        import pandas as pd
+        from datetime import datetime, timedelta
+        import time as t
+        MACRO_DIR = ROOT / "data" / "macro"
+        end   = datetime.today().strftime("%Y%m%d")
+        start = (datetime.today() - timedelta(days=450)).strftime("%Y%m%d")
+        for ticker, name in [("148070","bond_10y"),("114820","bond_3y"),("069500","kospi_index")]:
+            df = stock.get_market_ohlcv(start, end, ticker)
+            df.index = pd.to_datetime(df.index); df.index.name = "date"
+            df.to_parquet(MACRO_DIR / f"{name}.parquet", compression="snappy")
+            log.info(f"  매크로 {name}: {df.index.max().date()}")
+            t.sleep(0.5)
+    except Exception as e:
+        log.error(f"  매크로 업데이트 실패: {e}")
+
 
 def job_monitor():
     log.info("="*50)
@@ -130,10 +161,18 @@ if __name__ == "__main__":
         monitor_time = "16:10"
     else:
         monitor_time = "07:10"
+    macro_time = "07:05" if tz not in ("KST","Asia/Seoul") else "16:05"
     schedule.every().day.at(update_time).do(guarded(job_update))
+    schedule.every().monday.at(macro_time).do(guarded(job_macro_update))
+    # 어닝: 3/6/9/12월 15일 실적 발표 후 자동 수집
+    from datetime import datetime as dt
+    if dt.today().month in [3, 6, 9, 12] and dt.today().day == 15:
+        schedule.every().day.at("08:00").do(guarded(job_earnings_update))
+    log.info("  어닝 업데이트: 3/6/9/12월 15일 자동")
     schedule.every().day.at(monitor_time).do(guarded(job_monitor))
     schedule.every().day.at(signal_time).do(guarded(job_signal))
     log.info(f"  모니터링 시간:   {monitor_time} ({tz})")
+    log.info(f"  매크로 업데이트: 매주 월요일 {macro_time} ({tz})")
 
     # 시작 시 즉시 테스트 실행 옵션
     if "--run-now" in sys.argv:

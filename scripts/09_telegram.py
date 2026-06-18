@@ -204,6 +204,80 @@ def compute_features(panel: pd.DataFrame, feat_cols: list[str],
 # ─────────────────────────────────────────────────────────────────────────────
 # 예측 (단일 / 앙상블)
 # ─────────────────────────────────────────────────────────────────────────────
+def detect_regime(macro_df) -> str:
+    """현재 레짐 감지: A/B/C/D"""
+    if macro_df is None or macro_df.empty:
+        return "A"
+    latest = macro_df.iloc[-1]
+    bull = latest.get("macro_kospi_regime", 0) > 0.5
+    fall = latest.get("macro_rate_regime", 0)  > 0.5
+    if bull and fall:   return "A"
+    if bull and not fall: return "B"
+    if not bull and fall: return "C"
+    return "D"
+
+
+REGIME_LABELS = {
+    "A": "강세+금리하락 🟢",
+    "B": "강세+금리상승 🟡",
+    "C": "약세+금리하락 🟠",
+    "D": "약세+금리상승 🔴",
+}
+
+REGIME_IC = {
+    "A": 0.0967,
+    "B": 0.0616,
+    "C": 0.0069,
+    "D": 0.0596,
+}
+
+
+def predict_regime_v7(obj: dict, panel: pd.DataFrame,
+                      universe: list | None,
+                      macro_df=None) -> tuple:
+    """레짐별 독립 모델로 예측."""
+    log = logging.getLogger(__name__)
+
+    # 현재 레짐 감지
+    regime_id    = detect_regime(macro_df)
+    regime_model = obj["regimes"].get(regime_id)
+    regime_info  = obj.get("regime_defs", {}).get(regime_id, {})
+
+    # 레짐별 피처셋 선택 (약세장은 84피처 펀더멘털)
+    use_fund  = regime_info.get("use_fundamental", False)
+    feat_cols = obj.get("feat_cols_fund", obj["feat_cols"]) if use_fund                 else obj["feat_cols"]
+
+    log.info(f"  현재 레짐: {regime_id} ({REGIME_LABELS[regime_id]})")
+    log.info(f"  레짐 IC: {REGIME_IC[regime_id]:.4f}")
+
+    # 해당 레짐 모델 없으면 다른 레짐 중 IC 높은 것 사용
+    if regime_model is None:
+        for rid, ic_val in sorted(REGIME_IC.items(), key=lambda x: -x[1]):
+            if obj["regimes"].get(rid) is not None:
+                regime_model = obj["regimes"][rid]
+                log.warning(f"  레짐 {regime_id} 모델 없음 → {rid} 대체")
+                break
+
+    if regime_model is None:
+        raise RuntimeError("사용 가능한 레짐 모델 없음")
+
+    # 피처 계산
+    latest, signal_date = compute_features(panel, feat_cols, universe)
+
+    # 예측 (Ridge + EN 앙상블)
+    avail = [c for c in feat_cols if c in latest.columns]
+    X = latest[avail].fillna(0).values
+    scaler = regime_model["scaler"]
+    X_s    = scaler.transform(X)
+
+    p_ridge = regime_model["ridge"].predict(X_s)
+    p_en    = regime_model["en"].predict(X_s)
+    scores  = 0.5 * p_ridge + 0.5 * p_en
+
+    result = pd.Series(scores, index=latest.index, name="score")
+    return result, signal_date, regime_id
+
+
 def predict_single(obj: dict, panel: pd.DataFrame,
                    universe: list[str] | None) -> tuple[pd.Series, pd.Timestamp]:
     model     = obj["model"]
@@ -308,7 +382,21 @@ def generate_signal(model_path: Path, panel: pd.DataFrame,
     model_type = obj.get("type", "single")
     log.info(f"  모델 타입: {model_type}")
 
-    if model_type.startswith("ensemble3"):
+    # 매크로 데이터 로드 (레짐 감지용)
+    macro_df_for_regime = None
+    try:
+        from features.macro import load_macro
+        macro_dir = ROOT / "data" / "macro"
+        if macro_dir.exists():
+            macro_df_for_regime = load_macro(macro_dir)
+    except: pass
+
+    if model_type == "regime_ensemble_v7":
+        scores, signal_date, regime_id = predict_regime_v7(
+            obj, panel, universe, macro_df_for_regime
+        )
+        model_label = f"레짐 {regime_id} ({REGIME_LABELS.get(regime_id,'')}) IC={REGIME_IC.get(regime_id,0):.4f}"
+    elif model_type.startswith("ensemble3"):
         scores, signal_date = predict_ensemble3(obj, panel, universe)
         model_label = (f"앙상블 (ohlcv×{obj['w_ridge_ohlcv']} "
                        f"rf×{obj['w_ridge_full']} en×{obj['w_en_full']})")
@@ -417,6 +505,158 @@ def calc_positions(signal_df: pd.DataFrame, capital: float,
 # ─────────────────────────────────────────────────────────────────────────────
 # 메시지 포매터
 # ─────────────────────────────────────────────────────────────────────────────
+def get_ticker_metrics(tickers: list) -> dict:
+    """종목별 핵심 피처값 실시간 계산."""
+    try:
+        panel = pd.read_parquet(RAW_DIR / "kospi_recent.parquet")
+        metrics = {}
+        for tkr in tickers:
+            try:
+                tkr_data = panel[panel.index.get_level_values("ticker") == tkr].sort_index()
+                if tkr_data.empty:
+                    continue
+                close = tkr_data["close"]
+                fnet  = tkr_data["foreign_net"] if "foreign_net" in tkr_data.columns else pd.Series(dtype=float)
+                tv    = tkr_data["trade_value"]  if "trade_value"  in tkr_data.columns else pd.Series(dtype=float)
+
+                # 외인 매수 가속도 (최근 5일 vs 이전 5일)
+                fmom_chg = None
+                if len(fnet) >= 10 and len(tv) >= 10:
+                    f5_cur  = fnet.iloc[-5:].sum()
+                    f5_prev = fnet.iloc[-10:-5].sum()
+                    tv10    = tv.iloc[-10:].sum()
+                    if tv10 > 0:
+                        fmom_chg = (f5_cur - f5_prev) / tv10 * 100
+
+                # 외인 10일 누적 순매수
+                fcum10 = None
+                if len(fnet) >= 10 and len(tv) >= 10:
+                    tv10 = tv.iloc[-10:].sum()
+                    if tv10 > 0:
+                        fcum10 = fnet.iloc[-10:].sum() / tv10 * 100
+
+                # 52주 위치
+                pos52w = None
+                if len(close) >= 60:
+                    mn = close.iloc[-252:].min() if len(close) >= 252 else close.min()
+                    mx = close.iloc[-252:].max() if len(close) >= 252 else close.max()
+                    if mx > mn:
+                        pos52w = (close.iloc[-1] - mn) / (mx - mn) * 100
+
+                # 20일 수익률
+                mom20 = None
+                if len(close) >= 21:
+                    mom20 = (close.iloc[-1] / close.iloc[-21] - 1) * 100
+
+                # 기관 연속 매수일수
+                istreak = 0
+                inet = tkr_data["inst_net"] if "inst_net" in tkr_data.columns else pd.Series(dtype=float)
+                if len(inet) >= 3:
+                    for v in reversed(inet.iloc[-10:].values):
+                        if pd.isna(v): break
+                        if v > 0: istreak += 1
+                        else: break
+
+                # 기관 5일 누적
+                icum5 = None
+                if len(inet) >= 5 and len(tv) >= 5:
+                    tv5 = tv.iloc[-5:].sum()
+                    if tv5 > 0:
+                        icum5 = max(-30, min(30, inet.iloc[-5:].sum() / tv5 * 100))
+
+                metrics[tkr] = {
+                    "fmom_chg": fmom_chg,
+                    "fcum10":   fcum10,
+                    "pos52w":   pos52w,
+                    "mom20":    mom20,
+                    "istreak":  istreak,
+                    "icum5":    icum5,
+                }
+            except:
+                pass
+        return metrics
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"  피처 계산 실패: {e}")
+        return {}
+
+
+def fmt_reason(tkr: str, score: float, rank: int, total: int,
+               metrics: dict, macro_info: dict | None = None) -> tuple:
+    """
+    종목별 신호 이유 반환.
+    Returns: (warning: bool, line1: str, line2: str)
+    """
+    m = metrics.get(tkr, {})
+    fmom = m.get("fmom_chg")
+    fcum = m.get("fcum10")
+    p52  = m.get("pos52w")
+    mom  = m.get("mom20")
+
+    # 경고 조건 1: 외인 매도 중인데 상위권
+    foreign_selling = (fmom is not None and fmom < -1.0) or                       (fcum is not None and fcum < -3.0)
+    warning = foreign_selling and score > 0.5
+
+    # 경고 조건 2: 페이딩 신호 (스파이크 후 식어가는 중)
+    # fcum10 과도하게 높은데 fmom_chg 음수 = 과거 스파이크가 희석 중
+    fading = (fcum is not None and fcum > 20.0 and
+              fmom is not None and fmom < 0)
+    if fading:
+        warning = True
+
+    # 라인1: 기술적 (52주 위치 + 모멘텀)
+    tech_parts = []
+    if p52 is not None:
+        if p52 >= 80:
+            tech_parts.append(f"📍52주 {p52:.0f}%")
+        elif p52 >= 60:
+            tech_parts.append(f"📍52주 {p52:.0f}%")
+        else:
+            tech_parts.append(f"📍52주 {p52:.0f}% (저점)")
+    if mom is not None and abs(mom) >= 3:
+        icon = "🔺" if mom > 0 else "🔻"
+        tech_parts.append(f"{icon}20일 {mom:+.1f}%")
+
+    istreak = m.get("istreak", 0)
+    icum5   = m.get("icum5")
+
+    # 라인2: 수급
+    sup_parts = []
+    if fmom is not None:
+        if fmom > 0.5:
+            sup_parts.append(f"🐋외인가속 +{fmom:.1f}%")
+        elif fmom > 0:
+            sup_parts.append(f"🐋외인↑ +{fmom:.1f}%")
+        elif fmom < -0.5:
+            sup_parts.append(f"🔴외인↓ {fmom:.1f}%")
+    if fcum is not None and abs(fcum) >= 0.3:
+        arrow = "↑" if fcum > 0 else "↓"
+        color = "🟢" if fcum > 0 else "🔴"
+        sup_parts.append(f"{color}외인10일 {fcum:+.1f}%{arrow}")
+    if istreak >= 3:
+        sup_parts.append(f"🏦기관{istreak}일연속↑")
+    elif istreak <= -3:
+        sup_parts.append(f"🏦기관{abs(istreak)}일연속↓")
+    elif icum5 is not None and abs(icum5) >= 0.5:
+        arrow = "↑" if icum5 > 0 else "↓"
+        color = "🟢" if icum5 > 0 else "🔴"
+        sup_parts.append(f"{color}기관5일 {icum5:+.1f}%{arrow}")
+
+    # 레짐
+    regime_parts = []
+    if macro_info:
+        if macro_info.get("kospi_regime", 0) > 0.5:
+            regime_parts.append("강세장✓")
+        if macro_info.get("rate_regime", 0) > 0.5:
+            regime_parts.append("금리하락✓")
+
+    line1 = " · ".join(tech_parts) if tech_parts else "기술적 신호"
+    if fading:
+        sup_parts.insert(0, "📉페이딩신호")
+    line2 = " · ".join(sup_parts + regime_parts) if (sup_parts or regime_parts) else "수급 데이터 없음"
+
+    return warning, line1, line2
+
+
 def get_signal_reason(score: float, rank: int, total: int,
                       macro_info: dict | None = None) -> str:
     """점수 기반 신호 이유 생성."""
@@ -495,15 +735,30 @@ def fmt_signal(df: pd.DataFrame, top_n: int, market: str, horizon: int,
             f"",
         ]
 
-    # 매수 종목
+    # 매수 종목 — 핵심 피처값 기반 이유
+    ticker_metrics = get_ticker_metrics(longs["ticker"].tolist())
+    # 레짐 IC 표시
+    if macro_info:
+        regime = macro_info.get("regime_id", "")
+        if regime and regime in REGIME_IC:
+            lines.append(
+                f"  예측 IC: <b>{REGIME_IC[regime]:.4f}</b> "
+                f"(레짐 {regime} 역사적 평균)"
+            )
+            lines.append("")
     lines.append(f"📈 <b>매수 상위 {top_n}종목</b>")
     for _, r in longs.iterrows():
-        reason = get_signal_reason(r["score"], int(r["rank"]), total, macro_info)
-        lines.append(
-            f"  {int(r['rank']):>2}. <b>{r['name'][:8]}</b> {r['ticker']}"
-            f"  <code>{r['score']:+.3f}</code>"
+        warning, line1, line2 = fmt_reason(
+            r["ticker"], r["score"], int(r["rank"]),
+            total, ticker_metrics, macro_info
         )
-        lines.append(f"      ↳ {reason}")
+        warn_icon = " ⚠️" if warning else ""
+        lines.append(
+            f"  {int(r['rank']):>2}. <b>{r['name'][:8]}</b> "
+            f"<code>{r['score']:+.3f}</code>{warn_icon}"
+        )
+        lines.append(f"      {line1}")
+        lines.append(f"      {line2}")
 
     # 매도 종목 (이유 없이 간략히)
     lines += ["", f"📉 <b>매도 하위 {top_n}종목</b>"]
@@ -548,6 +803,7 @@ def find_model(market: str, horizon: int, model_name: str | None) -> Path:
 
     # 우선순위: ensemble3 > best_ > ridge_ohlcv
     candidates = [
+        MODEL_DIR / f"regime_v7_{market.lower()}_fwd{horizon}.pkl",
         MODEL_DIR / f"ensemble3_v6_{market.lower()}_fwd{horizon}.pkl",
         MODEL_DIR / f"ensemble3_v5_{market.lower()}_fwd{horizon}.pkl",
         MODEL_DIR / f"ensemble3_v3_{market.lower()}_fwd{horizon}.pkl",
