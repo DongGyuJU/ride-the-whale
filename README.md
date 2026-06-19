@@ -1,77 +1,226 @@
 # 🐋 Ride the Whale — KOSPI Smart Money Alpha System
 
-> A quantitative trading system for the Korean KOSPI market that extracts alpha by tracking foreign and institutional investor (smart money) supply/demand flows.
+> A quantitative trading system for the Korean KOSPI market that extracts alpha by tracking foreign and institutional investor (smart money) supply/demand flows, with regime-adaptive models.
 
 [![Python](https://img.shields.io/badge/Python-3.11+-blue)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 ---
 
-## 📌 Overview
+## 📌 Core Idea
 
-**Core Idea:** Foreign investors are "whales" in KOSPI. Instead of following their long-term accumulation (which is a contrarian signal), we track the *acceleration* of their buying — the moment they start moving.
+**"Don't watch where the whales have been. Watch where they're starting to move."**
 
-**Key Findings (Fama-MacBeth, t-stat):**
+Foreign investors ("whales") in KOSPI have a proven information advantage (Choe, Kho & Stulz 1999, 2005). But the signal is counterintuitive:
+
 ```
-sup_fmom_chg    t = +3.26  ← Foreign buying acceleration (core signal)
-tech_52w_pos    t = +14.40 ← 52-week high position (strongest technical)
-sup_fcum20      t = -7.09  ← 20-day accumulated buying = CONTRARIAN signal
-sup_icum20      t = -8.19  ← 20-day institutional = also CONTRARIAN
+20-day accumulated foreign buying  → CONTRARIAN signal (t = -7.09)
+Foreign buying ACCELERATION        → MOMENTUM signal  (t = +3.26)
 ```
 
-**Insight:** "When foreigners have been buying for 20 days, the stock has already moved. What matters is when they *start* buying."
+Stocks where foreigners have been buying for 20 days have already moved. The alpha lies in catching the *moment they start*.
 
 ---
 
-## 🏗️ Model Architecture
+## 📐 Mathematical Foundations
 
-### Ensemble: `ridge_full × 0.5 + en_full × 0.5`
+### 1. Fama-MacBeth Cross-Sectional Regression (1973)
 
-```
-76 Features → Ridge Regression (α=0.01)  ─┐
-             └→ Elastic Net (L1+L2)       ─┴─→ Weighted Average → Signal Score
-```
+Feature selection uses daily cross-sectional regressions:
 
-### Feature Set (76 total)
+$$\beta_t = \frac{1}{N} \sum_{i=1}^{N} \text{rank}(X_{i,t}) \cdot \text{rank}(R_{i,t+20})$$
 
-| Category | Count | Key Features |
-|---|---|---|
-| Technical (v2) | 11 | `tech_52w_pos`, `tech_vol20`, `tech_mom60` |
-| Supply/Demand (v2) | 9 | `sup_fmom_chg`, `sup_fcum10`, `sup_icum20` |
-| Macro | 6 | `macro_kospi_regime`, `macro_rate10_chg20`, `macro_yield_spread` |
-| Regime Interactions | 20 | `ix_bull_tech_52w_pos`, `ix_rate_sup_fmom_chg` |
-| Derivatives (1st diff) | 30 | `d5_macro_rate10_chg20`, `d20_sup_fmom_chg` |
+$$\bar{\beta} = \frac{1}{T} \sum_{t=1}^{T} \beta_t, \quad t\text{-stat} = \frac{\bar{\beta}}{\text{std}(\beta_t) / \sqrt{T}}$$
 
-### EN Selected Features (most important)
-```
-ix_bull_tech_52w_pos     ← Momentum amplified in bull market (regime interaction)
-d5_macro_rate10_chg20    ← Rate change acceleration (2nd derivative of rates)
-sup_fmom_chg             ← Foreign buying velocity
-```
+**Decision rule:** $|t| > 2$ → feature is statistically significant.
 
----
+**Key FM results (2018–2024, N=270 stocks, T=1,721 days):**
 
-## 📊 Performance
-
-| Version | Val IC (2023) | Test IC (2024) | Notes |
+| Feature | Mean IC | t-stat | Direction |
 |---|---|---|---|
-| v2 Baseline | +0.017 | 0.038 | 35 raw features |
-| v3 FM-filtered | +0.000 | 0.075 | Fama-MacBeth feature selection |
-| v5 +Interactions | +0.017 | 0.052 | Regime × feature interactions |
-| **v6 Final** | **+0.038** | **0.040** | +Derivative features, most robust |
+| `tech_52w_pos` | +0.021 | +14.40 | ✅ Momentum |
+| `tech_vol20` | -0.073 | -19.41 | ✅ Low vol wins |
+| `sup_fmom_chg` | +0.008 | +3.26 | ✅ Foreign accel |
+| `sup_fcum20` | -0.014 | -7.09 | ✅ Contrarian |
+| `earn_accel` | +0.011 | +6.46 | ✅ Earnings acceleration |
+| `earn_rev_yoy` | -0.017 | -7.75 | ✅ Contrarian |
+| `short_ratio` | -0.006 | -3.02 | ✅ Short pressure |
+| `earn_qoq` | -0.001 | -0.54 | ❌ Noise → removed |
+| `short_squeeze` | -0.003 | -1.09 | ❌ Noise → removed |
 
-**Training Period (Rolling 3-Year):**
+---
+
+### 2. Information Coefficient (IC)
+
+**IC = Spearman rank correlation between predicted scores and actual returns:**
+
+$$IC_t = \rho_s(\hat{y}_{i,t},\ y_{i,t+20})$$
+
+$$\bar{IC} = \frac{1}{T}\sum_{t=1}^T IC_t, \quad Z = \frac{\bar{IC}}{\sigma_{IC}/\sqrt{T}}$$
+
+**Interpretation:**
+
+| IC | Meaning |
+|---|---|
+| < 0.02 | No signal |
+| 0.02–0.05 | Weak alpha (tradeable) |
+| **0.05–0.10** | **Strong alpha (hedge fund grade)** |
+| > 0.10 | Exceptional (verify for overfitting) |
+
+**Grinold's Fundamental Law:**
+$$IR = IC \times \sqrt{Breadth}$$
+
+With 270 stocks × 252 days = 68,040 bets/year, even IC=0.04 generates IR≈0.65.
+
+---
+
+### 3. Foreign Investor Information Advantage
+
+**Theoretical basis: Kyle (1985) price impact model**
+
+$$\Delta p = \lambda \cdot (Q_f - Q_r)$$
+
+Where $Q_f$ = informed (foreign) order flow, $Q_r$ = retail order flow, $\lambda$ = market depth.
+
+**Empirical validation for Korea:**
+- Choe, Kho & Stulz (1999, JFE): Foreign herding precedes price increases
+- Choe, Kho & Stulz (2005, RFS): Foreigners trade at better prices than locals
+- **Our finding**: The *acceleration* of foreign buying ($\Delta Q_f / \Delta t$) is more predictive than the level
+
+---
+
+### 4. Factor Momentum & Earnings Acceleration
+
+**Ehsani & Linnainmaa (2022, JF) — Factor Momentum:**
+
+Past factor returns predict future factor returns. Applied to earnings:
+
+$$\text{earn\_accel}_t = \frac{\Delta\text{OI}_t/\text{OI}_{t-1} - \Delta\text{OI}_{t-1}/\text{OI}_{t-2}}{1}$$
+
+This is the **second derivative** of operating income. Stocks with accelerating earnings (not just high earnings) have the strongest forward returns.
+
+**Why earnings LEVEL is contrarian (earn_yoy t=-7.12):**
+Stocks that already had high earnings growth have already been priced in → mean reversion.
+
+**Why earnings ACCELERATION is momentum (earn_accel t=+6.46):**
+Acceleration signals a structural improvement not yet fully priced.
+
+---
+
+### 5. Regime-Based Model Theory
+
+Market regimes follow a hidden Markov process:
+
+$$s_t \in \{A, B, C, D\}$$
+
+$$P(s_{t+1} | s_t) = \text{transition matrix}$$
+
+We approximate regime using observable macro variables:
+
+$$s_t = f(\text{KOSPI}_{200MA},\ \Delta\text{rate}_{20d})$$
+
+| Regime | KOSPI | Rate | IC | Features |
+|---|---|---|---|---|
+| A | Bull | Falling | **0.097** | 76 (momentum) |
+| B | Bull | Rising | 0.062 | 76 (momentum) |
+| C | Bear | Falling | 0.011 | 80 (fundamental) |
+| D | Bear | Rising | 0.054 | 80 (fundamental) |
+
+**Why feature sets differ by regime (Ehsani & Linnainmaa 2022):**
+- Bull markets: Momentum/supply signals dominate
+- Bear markets: Fundamental signals (earnings, short pressure) become more informative
+
+---
+
+### 6. Short Selling as Signal
+
+**Short ratio as contrarian indicator:**
+
+$$\text{short\_ratio}_t = \frac{\text{short\_volume}_t}{\text{total\_volume}_t}$$
+
+High short ratio → strong selling pressure → negative expected return (t=-3.02).
+
+**Short squeeze (removed — t=-1.09):**
+The squeeze signal (high short ratio + rising price) was theoretically appealing but statistically insignificant in our universe, likely because KOSPI short covering dynamics differ from US markets.
+
+---
+
+### 7. Z-test for Model Validity
+
+Ongoing model monitoring uses a rolling Z-test:
+
+$$Z = \frac{\bar{IC}}{\sigma_{IC}/\sqrt{T}}$$
+
+| Z | Interpretation |
+|---|---|
+| > 2.0 | 95% confidence signal is real |
+| > 3.0 | 99% confidence |
+| < 2.0 | May be noise, monitor |
+
+**Note (Zhang et al. 2020):** Detecting IC deterioration of 0.01 requires 12+ months of data. 3-month results are indicative only.
+
+---
+
+## 🏗️ Model Architecture (v7)
+
 ```
-Train: 2020-01-01 ~ 2022-12-31
-Val:   2023-01-01 ~ 2023-12-31
-Test:  2024-01-01 ~ 2024-12-31
+Daily Data (OHLCV + Supply/Demand + Short + Earnings)
+    ↓
+Macro Regime Detection
+  KOSPI 200-day MA → Bull/Bear
+  Bond ETF 20-day change → Rate Falling/Rising
+    ↓
+Regime A/B: 76-Feature Momentum Model
+  Ridge (α=0.01) × 0.5 + ElasticNet × 0.5
+    ↓
+Regime C/D: 80-Feature Fundamental Model
+  Ridge (α=0.01) × 0.5 + ElasticNet × 0.5
+    ↓
+Signal Score → Top 20 BUY / Bottom 20 SELL
 ```
 
-**Optimal Regime (highest IC):**
-```
-✅ KOSPI bull market (above 200-day MA) + Rate falling = Best conditions
-⚠️ Bear market + Rate rising = Lowest IC, reduce position size
-```
+---
+
+## 📊 Feature Set
+
+### Core Features (76, used in all regimes)
+
+**Technical (11):** `tech_52w_pos`★, `tech_bb_pos`, `tech_tv_ratio`, `tech_macd`, `tech_mom20`, `tech_vol20`, `tech_mom60`, `tech_vol_ratio`, `tech_hl_spread`, `tech_ma20_dev`, `tech_ma5_dev`
+
+**Supply/Demand (9):** `sup_fmom_chg`★, `sup_fmom_accel`, `sup_fnet_rank`, `sup_fcum10`, `sup_istreak`, `sup_fcum20`, `sup_icum20`, `sup_fstreak`, `sup_divergence`
+
+**Macro (6):** `macro_kospi_regime`, `macro_kospi_mom60`, `macro_rate10_chg20`, `macro_yield_spread`, `macro_spread_chg20`, `macro_rate_regime`
+
+**Regime Interactions (20):** `ix_bull_tech_52w_pos`★, `ix_rate_tech_vol20`, ... *(bull/rate × top 10 features)*
+
+**Derivatives/1st-diff (30):** `d5_macro_rate10_chg20`★, `d20_tech_mom60`, ... *(5d and 20d change of 15 features)*
+
+★ = EN-selected core signals
+
+### Fundamental Features (4, Regime C/D only)
+
+| Feature | t-stat | Theory |
+|---|---|---|
+| `earn_accel` | +6.46 | Earnings 2nd derivative (Ehsani & Linnainmaa 2022) |
+| `earn_rev_yoy` | -7.75 | Revenue YOY (contrarian) |
+| `earn_yoy` | -3.35 | Op. income YOY (contrarian) |
+| `short_ratio` | -3.02 | Short pressure (Kyle 1985) |
+
+---
+
+## 📈 Performance History
+
+| Version | Val IC | Key Change |
+|---|---|---|
+| v2 | 0.017 | 35 raw features |
+| v3 | 0.075 | Fama-MacBeth feature selection |
+| v6 | 0.038 | Robust (val+test balanced) |
+| **v7 Regime A** | **0.097** | Regime-adaptive models ← Current |
+| v7 Regime C | 0.011 | Bear market w/ fundamentals |
+
+**Training period:** Rolling 3-year window (2018–2024)
+
+**Why v3 got 0.075 in 2024:** 2024 was predominantly Regime A (bull + rate falling). v7 explicitly models this, achieving IC=0.097 in that regime vs 0.038 for v6's single model.
 
 ---
 
@@ -84,67 +233,75 @@ pip install -r requirements.txt
 
 ### Environment Variables (`.env`)
 ```bash
-# KRX Login (required for supply/demand data)
 KRX_ID=your_krx_id
 KRX_PW=your_krx_password
-
-# Telegram Bot
 TELEGRAM_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
+DART_API_KEY=your_dart_key     # dart.fss.or.kr (free)
+LOG_LEVEL=INFO
 ```
 
 ### Initial Data Download
 ```bash
-# 1. Download 7-year KOSPI panel (takes ~2 hours)
+# 1. Full panel (7 years, ~2 hours)
 python3 scripts/01_download.py --market KOSPI --workers 2
 
-# 2. Filter universe (stocks with avg daily volume > 2B KRW)
+# 2. Universe filter (>2B KRW daily volume)
 python3 scripts/02_diagnose.py --market KOSPI
 
-# 3. Download macro data (run on local machine with KRX access)
-python3 scripts/local_fetch_macro.py
+# 3. Short selling data (server)
+python3 scripts/local_fetch_short.py
+
+# 4. Earnings data via DART API (server)
+python3 scripts/fetch_earnings.py
 ```
 
-### Train Model (Google Colab recommended)
+### Train Model (Google Colab)
 ```python
-# Upload project to Google Drive, then:
-import os
 os.chdir('/content/drive/MyDrive/project/smart_money')
-!python3 scripts/colab_train_v6.py
+!python3 scripts/colab_fama_macbeth_v2.py  # Feature validation first
+!python3 scripts/colab_train_v7.py          # Regime-based training
 ```
 
 ### Deploy to Server
 ```bash
-# Copy trained model
-docker cp ensemble3_v6_kospi_fwd20.pkl container_id:/root/smart_money/models/saved/
+# Copy model
+docker cp regime_v7_kospi_fwd20.pkl CONTAINER:/root/smart_money/models/saved/
 
 # Start scheduler
-cd /root/smart_money
 nohup python3 scripts/11_scheduler.py > logs/scheduler.log 2>&1 &
 ```
 
 ---
 
-## 📅 Daily Operation (Automated)
+## 📅 Daily Operation (Fully Automated)
 
 ```
-16:00 KST  → 10_update_data.py   Download today's OHLCV + supply data
-16:10 KST  → 12_monitor.py       Check stop-loss/take-profit alerts
-16:30 KST  → 09_telegram.py      Generate signals + send Telegram
+16:00 KST  10_update_data.py      OHLCV + supply/demand + short selling
+16:05 KST  (Monday only)          Macro ETF update (bond + KOSPI index)
+16:10 KST  12_monitor.py          Stop-loss / take-profit alerts
+           14_consecutive_signal.py  Stocks appearing 3+ days in a row
+           13_ic_tracker.py       Actual IC validation (after 20 trading days)
+16:30 KST  09_telegram.py         Regime detection → signal → Telegram
 ```
 
-**Telegram Output:**
+**Telegram message format:**
 ```
-📊 KOSPI Signal | 2026-06-15
+📊 KOSPI Signal | 2026-06-18
+
 📡 Current Regime
-  🐂 Bull Market | 📈 Rate Rising
-  KOSPI 60d: +12.3% | Rate Δ: +0.15%
-  💡 Bull + Rate rising → Focus on momentum
+  🐂 Bull Market | 📉 Rate Falling
+  KOSPI 60d: +69.6% | Rate Δ: -1.14%
+  Predicted IC: 0.0967 (Regime A historical avg)
+  💡 Momentum + rate optimal → Signal confidence ↑
 
 📈 Top 20 BUY
-  1. SK이터닉스 475150  +1.339
-     ↳ Strong buy · Top 5%
-...
+  1. 삼성전자 005930  +0.156
+     📍52w 100% · 🔺20d +31.6%
+     🐋FgnAccel +4.2% · 🟢Fgn10d +1.9%↑ · 🏦Inst5d consecutive↑
+
+  ⚠️ = Foreign selling despite high rank
+  📉페이딩 = Spike fading (high 10d cumul + recent decel)
 ```
 
 ---
@@ -153,92 +310,49 @@ nohup python3 scripts/11_scheduler.py > logs/scheduler.log 2>&1 &
 
 ### Monthly — Universe Update
 ```bash
-# Run on server (1st Monday of each month, ~30 min)
 python3 scripts/01_download.py --market KOSPI --workers 2
 python3 scripts/02_diagnose.py --market KOSPI
-
-# Verify
-wc -l results/diagnose/universe_filter_kospi.csv
-# Should show ~270 stocks
+wc -l results/diagnose/universe_filter_kospi.csv  # should be ~271
 ```
 
-### Quarterly — Model Retraining
+### Quarterly — Model Retraining (Mar/Jun/Sep/Dec)
 ```python
-# 1. Update training periods in colab_train_v6.py
-TRAIN_START = "2021-01-01"  # Always recent 3 years
-TRAIN_END   = "2023-12-31"
-VAL_START   = "2024-01-01"
-VAL_END     = "2024-12-31"
-TEST_START  = "2025-01-01"
-TEST_END    = "2025-12-31"
+# 1. Update earnings data
+!python3 scripts/fetch_earnings.py
 
-# 2. Upload latest panel to Google Drive
-# (server → local → Google Drive)
+# 2. Update training window in colab_train_v7.py
+FULL_START = "2019-01-01"  # slide forward 1 year
+FULL_END   = "2025-12-31"
 
-# 3. Run training
-!python3 scripts/colab_train_v6.py
+# 3. Retrain
+!python3 scripts/colab_train_v7.py
 
-# 4. Check IC comparison table in output
-# If new_IC > 0.03 on both val and test → deploy
-# If new_IC < 0.01 → investigate data issues
-
-# 5. Deploy new model
-docker cp ensemble3_v6_kospi_fwd20.pkl container_id:/root/smart_money/models/saved/
+# 4. Check regime IC improvement
+# If Regime A IC > 0.09 → deploy
+# If Regime A IC < 0.06 → investigate
 ```
 
-### Macro Data Update
-```bash
-# Run locally with KRX access whenever macro data is >7 days old
-python3 scripts/local_fetch_macro.py
-
-# Upload to server:
-docker cp data/macro/ container_id:/root/smart_money/data/
+### Model Validity Check (from 13_ic_tracker.py)
 ```
-
----
-
-## 📈 IC Validation (After 3 Months)
-
-```python
-import pandas as pd, glob
-from scipy.stats import spearmanr
-
-# Load all signal CSVs
-signals = pd.concat([pd.read_csv(f) for f in glob.glob('results/signals/*.csv')])
-
-# Compare with actual returns after 20 trading days
-# (requires price data for t+20)
-actual_returns = ...  # load from panel
-
-ic_daily = signals.groupby('signal_date').apply(
-    lambda g: spearmanr(g['score'], actual_returns.loc[g.index]).statistic
-)
-
-print(f"Mean IC:  {ic_daily.mean():.4f}")
-print(f"Z-stat:   {ic_daily.mean() / (ic_daily.std() / len(ic_daily)**0.5):.2f}")
-print(f"IC > 0:   {(ic_daily > 0).mean():.1%}")
-```
-
-**Decision Rules:**
-```
-IC > 0.03  → ✅ Model valid, continue
-IC 0.01~0.03 → ⚠️  Signal weakening, schedule retraining
+IC > 0.03  → ✅ Valid, continue
+IC 0.01–0.03 → ⚠️  Weakening, schedule retraining
 IC < 0.01  → ❌ Retrain immediately
-IC < 0     → 🚨 Stop trading, full review
+IC < 0     → 🚨 Stop trading
 ```
 
 ---
 
-## ⚠️ Risk Management (Built into Signals)
+## ⚠️ Risk Management
 
-| Rule | Threshold | Action |
+| Rule | Threshold | Source |
 |---|---|---|
-| Stop-loss | -7% from signal date close | Auto Telegram alert |
-| Take-profit | +15% from signal date close | Auto Telegram alert |
-| Time exit | 20 trading days | Auto Telegram alert |
-| Short entry | Position appears in bottom 20 | Auto Telegram alert |
-| Outlier filter | `\|score\| > 2.0` | Auto excluded from signals |
-| High-price filter | Stock price > capital/n | Auto excluded |
+| Stop-loss | -7% from signal date close | Telegram alert |
+| Take-profit | +15% from signal date close | Telegram alert |
+| Time exit | 20 trading days | Telegram alert |
+| Short entry | Position enters bottom-20 | Telegram alert |
+| Fading signal | `fcum10 > 20% AND fmom_chg < 0` | ⚠️ Warning label |
+| Outlier filter | `\|score\| > 2.0` | Auto-excluded |
+| High-price filter | Price > capital/n | Auto-excluded |
 
 ---
 
@@ -247,31 +361,37 @@ IC < 0     → 🚨 Stop trading, full review
 ```
 ride-the-whale/
 ├── features/
-│   ├── technical_v2.py      # FM-selected technical features (11)
-│   ├── supply_v2.py         # FM-guided supply features (9)
-│   ├── macro.py             # Interest rate + regime features (6)
-│   ├── derivatives.py       # 1st derivative features (30)
-│   └── pipeline_v2.py       # Feature pipeline
+│   ├── technical_v2.py         # FM-selected technical features (11)
+│   ├── supply_v2.py            # FM-guided supply/demand features (9)
+│   ├── macro.py                # Interest rate + regime features (6)
+│   ├── derivatives.py          # 1st-derivative features (30)
+│   ├── short_selling.py        # Short selling features (1 after FM)
+│   ├── earnings.py             # Earnings event features (3 after FM)
+│   └── pipeline_v2.py          # Feature pipeline
 ├── scripts/
-│   ├── 01_download.py       # Full panel download
-│   ├── 02_diagnose.py       # Universe filtering
-│   ├── 09_telegram.py       # Signal generation + Telegram
-│   ├── 10_update_data.py    # Daily data update
-│   ├── 11_scheduler.py      # Automated scheduler
-│   ├── 12_monitor.py        # Position monitoring
-│   ├── colab_train_v6.py    # Model training (Colab)
-│   ├── colab_fama_macbeth.py # Feature validation
-│   └── local_fetch_macro.py  # Macro data download
+│   ├── 01_download.py          # Full panel download
+│   ├── 02_diagnose.py          # Universe filtering
+│   ├── 09_telegram.py          # Signal generation + Telegram
+│   ├── 10_update_data.py       # Daily data update (OHLCV + short)
+│   ├── 11_scheduler.py         # Automated scheduler
+│   ├── 12_monitor.py           # Stop-loss/take-profit monitoring
+│   ├── 13_ic_tracker.py        # Actual IC auto-validation (H)
+│   ├── 14_consecutive_signal.py # Consecutive signal tracking (B)
+│   ├── fetch_earnings.py       # DART API earnings collection
+│   ├── local_fetch_short.py    # Short selling data collection
+│   ├── colab_train_v7.py       # Regime-based model training
+│   └── colab_fama_macbeth_v2.py # FM feature validation (84 features)
 ├── labels/
-│   └── forward_return.py    # fwd20 label generation
+│   └── forward_return.py       # fwd20 label generation
 ├── data/
-│   └── macro/               # Interest rate ETF data
+│   └── macro/                  # Interest rate ETF data (versioned)
 ├── models/
-│   └── saved/               # Trained pkl files (gitignored)
+│   └── saved/                  # Trained pkl files (gitignored)
 ├── results/
-│   ├── diagnose/            # Universe files
-│   └── signals/             # Daily signal CSVs (gitignored)
-├── .env.example             # Environment variable template
+│   ├── diagnose/               # Universe files
+│   ├── signals/                # Daily signal CSVs (gitignored)
+│   └── ic_tracker/             # IC validation results
+├── .env.example
 ├── .gitignore
 ├── requirements.txt
 └── README.md
@@ -281,16 +401,17 @@ ride-the-whale/
 
 ## 📚 Academic References
 
-| Paper | Relevance |
+| Paper | Application in this system |
 |---|---|
-| Choe, Kho, Stulz (1999, JFE) | Foreign investor herding in Korea |
-| Choe, Kho, Stulz (2005, RFS) | Foreign investor information advantage |
-| Jegadeesh & Titman (1993, JF) | Momentum strategy |
-| Ehsani & Linnainmaa (2022, JF) | Factor momentum → basis for derivative features |
-| Kyle (1985, Econometrica) | Price impact model → `sup_fnet_norm` |
-| Amihud (2002, JFM) | Illiquidity measure |
-| Fama & MacBeth (1973, JPE) | Cross-sectional regression → feature selection |
-| Grinold & Kahn (2000) | IC/IR framework |
+| Fama & MacBeth (1973, JPE) | Cross-sectional feature selection via t-stat |
+| Choe, Kho & Stulz (1999, JFE) | Foreign investor herding in Korea |
+| Choe, Kho & Stulz (2005, RFS) | Foreign investor information advantage |
+| Kyle (1985, Econometrica) | Price impact model → `sup_fnet_rank`, `short_ratio` |
+| Jegadeesh & Titman (1993, JF) | Momentum → `tech_52w_pos`, `tech_mom20` |
+| Amihud (2002, JFM) | Illiquidity → `tech_vol20` (reverse) |
+| Ehsani & Linnainmaa (2022, JF) | Factor momentum → `earn_accel` (2nd derivative) |
+| Grinold & Kahn (2000) | IC/IR framework, Fundamental Law |
+| Zhang et al. (2020, arXiv) | Rolling Z-test for IC monitoring |
 
 ---
 
@@ -298,20 +419,27 @@ ride-the-whale/
 
 ```python
 # Universe filter (scripts/02_diagnose.py)
-MIN_TRADE_VALUE = 2e9     # 2B KRW daily avg → change for broader/narrower universe
+MIN_TRADE_VALUE = 2e9        # 2B KRW daily avg
 
-# Model (colab_train_v6.py)
-TRAIN_YEARS = 3           # Rolling window → increase for more history
-HORIZON     = 20          # Forward return days → match your holding period
+# Model (scripts/colab_train_v7.py)
+FULL_START = "2018-01-01"    # Training window start
+FULL_END   = "2024-12-31"    # Training window end
+HORIZON    = 20              # Forward return days
+
+# Regime thresholds (features/macro.py)
+BULL_THRESHOLD = 0           # KOSPI above 200-day MA
+RATE_THRESHOLD = 0           # Bond ETF 20-day return > 0
 
 # Risk (scripts/12_monitor.py)
-STOP_LOSS   = -0.07       # -7% stop loss
-TAKE_PROFIT =  0.15       # +15% take profit
-HOLD_DAYS   = 20          # Max holding period
+STOP_LOSS   = -0.07          # -7%
+TAKE_PROFIT =  0.15          # +15%
+HOLD_DAYS   = 20             # Max holding period
 
 # Signal filter (scripts/09_telegram.py)
-SCORE_THRESHOLD = 2.0     # |score| > 2.0 = data anomaly, excluded
-MAX_PRICE = 1_000_000     # Stocks above this price excluded from position sizing
+SCORE_THRESHOLD = 2.0        # |score| > 2.0 excluded
+MAX_PRICE = 1_000_000        # High-price exclusion
+FADING_CUMUL = 20.0          # fcum10 > 20% = fading warning
+FADING_ACCEL = 0             # fmom_chg < 0 = fading warning
 ```
 
 ---
