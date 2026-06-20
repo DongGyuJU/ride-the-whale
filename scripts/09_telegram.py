@@ -68,10 +68,46 @@ def send_message(token: str, chat_id: str, text: str) -> bool:
 
 
 def send_long(token: str, chat_id: str, text: str) -> bool:
-    for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-        if not send_message(token, chat_id, chunk):
+    log = logging.getLogger(__name__)
+    # 줄 단위로 청크 분할 (HTML 태그 중간에서 잘리지 않게)
+    lines = text.split("\n")
+    chunks, cur = [], ""
+    for line in lines:
+        if len(cur) + len(line) + 1 > 4000:
+            if cur: chunks.append(cur)
+            cur = line
+        else:
+            cur = cur + "\n" + line if cur else line
+    if cur: chunks.append(cur)
+    for i, chunk in enumerate(chunks):
+        try:
+            # 1차: HTML 모드
+            resp = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                time.sleep(0.3)
+                continue
+            # HTML 실패 → 에러 로깅
+            err = resp.json().get("description", "unknown")
+            log.warning(f"  HTML 발송 실패: {err}")
+            # 2차: plain text로 재시도 (HTML 태그 제거)
+            import re
+            plain = re.sub(r"<[^>]+>", "", chunk)
+            resp2 = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": plain},
+                timeout=10,
+            )
+            if resp2.status_code != 200:
+                log.error(f"  plain text도 실패: {resp2.json()}")
+                return False
+            time.sleep(0.3)
+        except Exception as e:
+            log.error(f"  발송 예외: {e}")
             return False
-        time.sleep(0.3)
     return True
 
 
@@ -231,51 +267,79 @@ REGIME_IC = {
     "D": 0.0596,
 }
 
+# 레짐별 최적 호라이즌 (멀티 호라이즌 결과 기반)
+REGIME_HORIZON = {
+    "A": 60,   # 강세+금리하락: fwd60 IC=0.154
+    "B": 60,   # 강세+금리상승: fwd60 IC=0.153
+    "C": 20,   # 약세+금리하락: fwd5 음수, fwd20 사용
+    "D": 20,   # 약세+금리상승: fwd5 음수, fwd20 사용
+}
+
+REGIME_IC_BEST = {
+    "A": {"fwd5": 0.040, "fwd20": 0.097, "fwd60": 0.154},
+    "B": {"fwd5": 0.050, "fwd20": 0.062, "fwd60": 0.153},
+    "C": {"fwd5":-0.033, "fwd20": 0.011, "fwd60": 0.062},
+    "D": {"fwd5":-0.025, "fwd20": 0.054, "fwd60": 0.063},
+}
+
 
 def predict_regime_v7(obj: dict, panel: pd.DataFrame,
                       universe: list | None,
                       macro_df=None) -> tuple:
-    """레짐별 독립 모델로 예측."""
+    """레짐별 독립 모델로 예측 — 3개 호라이즌 동시."""
     log = logging.getLogger(__name__)
+    import pickle as _pkl
 
-    # 현재 레짐 감지
-    regime_id    = detect_regime(macro_df)
-    regime_model = obj["regimes"].get(regime_id)
-    regime_info  = obj.get("regime_defs", {}).get(regime_id, {})
-
-    # 레짐별 피처셋 선택 (약세장은 84피처 펀더멘털)
-    use_fund  = regime_info.get("use_fundamental", False)
-    feat_cols = obj.get("feat_cols_fund", obj["feat_cols"]) if use_fund                 else obj["feat_cols"]
+    regime_id   = detect_regime(macro_df)
+    regime_info = obj.get("regime_defs", {}).get(regime_id, {})
+    use_fund    = regime_info.get("use_fundamental", False)
+    opt_horizon = REGIME_HORIZON.get(regime_id, 20)
 
     log.info(f"  현재 레짐: {regime_id} ({REGIME_LABELS[regime_id]})")
     log.info(f"  레짐 IC: {REGIME_IC[regime_id]:.4f}")
+    log.info(f"  최적 호라이즌: fwd{opt_horizon}")
 
-    # 해당 레짐 모델 없으면 다른 레짐 중 IC 높은 것 사용
-    if regime_model is None:
-        for rid, ic_val in sorted(REGIME_IC.items(), key=lambda x: -x[1]):
-            if obj["regimes"].get(rid) is not None:
-                regime_model = obj["regimes"][rid]
-                log.warning(f"  레짐 {regime_id} 모델 없음 → {rid} 대체")
-                break
+    score_map   = {}   # {ticker: score} 메인
+    h_score_map = {}   # {"fwd5": {ticker: score}, ...}
+    signal_date = None
 
-    if regime_model is None:
-        raise RuntimeError("사용 가능한 레짐 모델 없음")
+    for h in [5, 20, 60]:
+        mpath = ROOT / "models" / "saved" / f"regime_v7_kospi_fwd{h}.pkl"
+        if not mpath.exists():
+            log.warning(f"  fwd{h} 모델 없음 — 스킵")
+            continue
+        with open(mpath, "rb") as mf:
+            h_obj = _pkl.load(mf)
 
-    # 피처 계산
-    latest, signal_date = compute_features(panel, feat_cols, universe)
+        h_info   = h_obj.get("regime_defs", {}).get(regime_id, {})
+        h_fund   = h_info.get("use_fundamental", False)
+        h_cols   = h_obj.get("feat_cols_fund", h_obj["feat_cols"]) if h_fund                    else h_obj["feat_cols"]
+        h_model  = h_obj["regimes"].get(regime_id)
+        if h_model is None:
+            continue
 
-    # 예측 (Ridge + EN 앙상블)
-    avail = [c for c in feat_cols if c in latest.columns]
-    X = latest[avail].fillna(0).values
-    scaler = regime_model["scaler"]
-    X_s    = scaler.transform(X)
+        latest, sd = compute_features(panel, h_cols, universe)
+        if signal_date is None:
+            signal_date = sd
 
-    p_ridge = regime_model["ridge"].predict(X_s)
-    p_en    = regime_model["en"].predict(X_s)
-    scores  = 0.5 * p_ridge + 0.5 * p_en
+        # latest 인덱스 → ticker 문자열
+        if isinstance(latest.index, pd.MultiIndex):
+            tickers = latest.index.get_level_values("ticker").astype(str).str.zfill(6)
+        else:
+            tickers = latest.index.astype(str).str.zfill(6)
 
-    result = pd.Series(scores, index=latest.index, name="score")
-    return result, signal_date, regime_id
+        avail = [c for c in h_cols if c in latest.columns]
+        X = latest[avail].fillna(0).values
+        X_s = h_model["scaler"].transform(X)
+        s = 0.5 * h_model["ridge"].predict(X_s) + 0.5 * h_model["en"].predict(X_s)
+
+        h_score_map[f"fwd{h}"] = dict(zip(tickers, s))
+        if h == opt_horizon:
+            score_map = dict(zip(tickers, s))
+        log.info(f"  fwd{h} 예측 완료 ({len(tickers)}종목)")
+
+    main_scores = pd.Series(score_map, name="score")
+    return main_scores, h_score_map, signal_date, regime_id
 
 
 def predict_single(obj: dict, panel: pd.DataFrame,
@@ -392,7 +456,7 @@ def generate_signal(model_path: Path, panel: pd.DataFrame,
     except: pass
 
     if model_type == "regime_ensemble_v7":
-        scores, signal_date, regime_id = predict_regime_v7(
+        scores, h_scores, signal_date, regime_id = predict_regime_v7(
             obj, panel, universe, macro_df_for_regime
         )
         model_label = f"레짐 {regime_id} ({REGIME_LABELS.get(regime_id,'')}) IC={REGIME_IC.get(regime_id,0):.4f}"
@@ -423,6 +487,11 @@ def generate_signal(model_path: Path, panel: pd.DataFrame,
     result["direction"]   = "neutral"
     result.loc[result["rank"] <= top_n,             "direction"] = "LONG"
     result.loc[result["rank"] > len(result)-top_n,  "direction"] = "SHORT"
+
+    # 멀티 호라이즌 점수 병합
+    if model_type == "regime_ensemble_v7":
+        for h_key, h_map in h_scores.items():
+            result[f"score_{h_key}"] = result["ticker"].map(h_map)
 
     return result
 
@@ -510,9 +579,12 @@ def get_ticker_metrics(tickers: list) -> dict:
     try:
         panel = pd.read_parquet(RAW_DIR / "kospi_recent.parquet")
         metrics = {}
+        # panel ticker를 6자리 문자열로 정규화
+        panel_idx = panel.index.get_level_values("ticker").astype(str).str.zfill(6)
         for tkr in tickers:
+            tkr = str(tkr).zfill(6)
             try:
-                tkr_data = panel[panel.index.get_level_values("ticker") == tkr].sort_index()
+                tkr_data = panel[panel_idx == tkr].sort_index()
                 if tkr_data.empty:
                     continue
                 close = tkr_data["close"]
@@ -726,12 +798,20 @@ def fmt_signal(df: pd.DataFrame, top_n: int, market: str, horizon: int,
         else:
             regime_msg = "약세장+금리상승 → 신호 신뢰도 낮음, 소규모 운용"
 
+        regime_id = macro_info.get("regime_id", "A")
+        ic_table  = REGIME_IC_BEST.get(regime_id, {})
+        opt_h     = REGIME_HORIZON.get(regime_id, 20)
         lines += [
             f"📡 <b>현재 시장 레짐</b>",
             f"  {kospi_label} | {rate_label}",
             f"  KOSPI 60일: {kospi_mom:+.1%} | 금리변화: {rate_chg:+.2%}",
-            f"  장단기스프레드: {spread:+.4f}",
             f"  💡 {regime_msg}",
+            f"",
+            f"  IC by horizon:",
+            f"  1주(fwd5)  {ic_table.get('fwd5',0):+.3f}  "
+            f"1달(fwd20) {ic_table.get('fwd20',0):+.3f}  "
+            f"3달(fwd60) {ic_table.get('fwd60',0):+.3f}",
+            f"  📌 현재 기준: <b>fwd{opt_h}</b> 사용",
             f"",
         ]
 
@@ -749,14 +829,25 @@ def fmt_signal(df: pd.DataFrame, top_n: int, market: str, horizon: int,
     lines.append(f"📈 <b>매수 상위 {top_n}종목</b>")
     for _, r in longs.iterrows():
         warning, line1, line2 = fmt_reason(
-            r["ticker"], r["score"], int(r["rank"]),
+            str(r["ticker"]).zfill(6), r["score"], int(r["rank"]),
             total, ticker_metrics, macro_info
         )
         warn_icon = " ⚠️" if warning else ""
+        # 3개 호라이즌 점수
+        h_scores = ""
+        for h, label in [(5,"1주"),(20,"1달"),(60,"3달")]:
+            col = f"score_fwd{h}"
+            if col in r.index and not pd.isna(r[col]):
+                v = r[col]
+                icon = "🟢" if v > 0 else "🔴"
+                h_scores += f"{label}{icon}{v:+.2f} "
+
         lines.append(
             f"  {int(r['rank']):>2}. <b>{r['name'][:8]}</b> "
             f"<code>{r['score']:+.3f}</code>{warn_icon}"
         )
+        if h_scores:
+            lines.append(f"      {h_scores.strip()}")
         lines.append(f"      {line1}")
         lines.append(f"      {line2}")
 
@@ -764,7 +855,7 @@ def fmt_signal(df: pd.DataFrame, top_n: int, market: str, horizon: int,
     lines += ["", f"📉 <b>매도 하위 {top_n}종목</b>"]
     for _, r in shorts.sort_values("rank").iterrows():
         lines.append(
-            f"  {int(r['rank']):>3}. {r['name'][:8]} {r['ticker']}"
+            f"  {int(r['rank']):>3}. {r['name'][:8]} {str(r['ticker']).zfill(6)}"
             f"  <code>{r['score']:+.3f}</code>"
         )
 
@@ -887,12 +978,16 @@ def main():
         if macro_dir.exists():
             mdf = load_macro(macro_dir)
             latest = mdf.iloc[-1]
+            rate_r = float(latest.get("macro_rate_regime", 0))
+            bull_r = float(latest.get("macro_kospi_regime", 0))
+            rid = "A" if bull_r>0.5 and rate_r>0.5 else                   "B" if bull_r>0.5 else                   "C" if rate_r>0.5 else "D"
             macro_info = {
-                "rate_regime":  float(latest.get("macro_rate_regime", 0)),
-                "kospi_regime": float(latest.get("macro_kospi_regime", 0)),
+                "rate_regime":  rate_r,
+                "kospi_regime": bull_r,
                 "kospi_mom60":  float(latest.get("macro_kospi_mom60", 0)),
                 "rate10_chg20": float(latest.get("macro_rate10_chg20", 0)),
                 "yield_spread": float(latest.get("macro_yield_spread", 0)),
+                "regime_id":    rid,
             }
     except Exception as e:
         logging.getLogger(__name__).warning(f"  레짐 정보 로드 실패: {e}")
